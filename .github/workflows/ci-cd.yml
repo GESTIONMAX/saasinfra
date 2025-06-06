@@ -1,0 +1,244 @@
+name: 🚀 CI/CD GESTIONMAX SaaS Infrastructure
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # =======================
+  # VALIDATION & TESTS
+  # =======================
+  validate:
+    name: 🔍 Validation
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Validate Docker Compose
+      run: |
+        docker compose config
+        echo "✅ Docker Compose syntax valid"
+
+    - name: Check file structure
+      run: |
+        required_files=(
+          "docker-compose.yml"
+          "traefik/traefik.yml"
+          "monitoring/prometheus.yml"
+          "monitoring/alertmanager.yml"
+          "README.md"
+        )
+        
+        for file in "${required_files[@]}"; do
+          if [ ! -f "$file" ]; then
+            echo "❌ Missing required file: $file"
+            exit 1
+          fi
+        done
+        echo "✅ All required files present"
+
+    - name: Lint YAML files
+      uses: ibiqlik/action-yamllint@v3
+      with:
+        file_or_dir: |
+          docker-compose.yml
+          monitoring/
+          traefik/
+        config_file: .yamllint.yml
+
+  # =======================
+  # SECURITY SCAN
+  # =======================
+  security:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: Check for secrets
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: main
+        head: HEAD
+
+  # =======================
+  # BUILD & TEST
+  # =======================
+  test:
+    name: 🧪 Integration Tests
+    runs-on: ubuntu-latest
+    needs: [validate, security]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Create external network
+      run: docker network create web
+
+    - name: Start infrastructure
+      run: |
+        # Create minimal .env for testing
+        cat > .env << EOF
+        POSTGRES_PASSWORD=test123
+        REDIS_PASSWORD=test123
+        GRAFANA_ADMIN_PASSWORD=test123
+        EOF
+        
+        # Start core services
+        docker compose up -d traefik prometheus grafana postgres redis
+        
+        # Wait for services
+        sleep 60
+
+    - name: Health checks
+      run: |
+        # Test service endpoints
+        curl -f http://localhost:8081/dashboard/ || exit 1
+        curl -f http://localhost:9092/-/healthy || exit 1
+        curl -f http://localhost:3002/api/health || exit 1
+        
+        echo "✅ All services healthy"
+
+    - name: Run monitoring tests
+      run: |
+        # Test Prometheus targets
+        targets=$(curl -s http://localhost:9092/api/v1/targets | jq '.data.activeTargets | length')
+        if [ "$targets" -lt 2 ]; then
+          echo "❌ Not enough Prometheus targets"
+          exit 1
+        fi
+        
+        echo "✅ Monitoring tests passed"
+
+    - name: Cleanup
+      if: always()
+      run: |
+        docker compose down -v
+        docker network rm web || true
+
+  # =======================
+  # DEPLOY STAGING
+  # =======================
+  deploy-staging:
+    name: 🚀 Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Deploy to staging server
+      uses: appleboy/ssh-action@v0.1.7
+      with:
+        host: ${{ secrets.STAGING_HOST }}
+        username: ${{ secrets.STAGING_USER }}
+        key: ${{ secrets.STAGING_SSH_KEY }}
+        script: |
+          cd /opt/gestionmax-staging
+          git pull origin develop
+          chmod +x scripts/deploy.sh
+          ./scripts/deploy.sh
+
+    - name: Run staging tests
+      run: |
+        # Wait for deployment
+        sleep 120
+        
+        # Test staging endpoints
+        curl -f https://staging-dashboard.gestionmax.fr/api/health || exit 1
+        echo "✅ Staging deployment successful"
+
+  # =======================
+  # DEPLOY PRODUCTION
+  # =======================
+  deploy-production:
+    name: 🏭 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Create GitHub Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v${{ github.run_number }}
+        release_name: Release v${{ github.run_number }}
+        body: |
+          🚀 **GESTIONMAX SaaS Infrastructure Release v${{ github.run_number }}**
+          
+          **Changes in this release:**
+          ${{ github.event.head_commit.message }}
+          
+          **Services included:**
+          - Traefik v3.0 (Reverse Proxy)
+          - Prometheus (Monitoring)
+          - Grafana (Dashboards)
+          - PostgreSQL 15 (Database)
+          - Redis 7 (Cache)
+          - Alertmanager (Alerts)
+          - Loki (Logs)
+          - MinIO (Storage)
+          - Uptime Kuma (Status)
+          
+          **Deployment:**
+          - Staging: ✅ Deployed
+          - Production: 🚀 Ready
+        draft: false
+        prerelease: false
+
+    - name: Deploy to production
+      uses: appleboy/ssh-action@v0.1.7
+      with:
+        host: ${{ secrets.PROD_HOST }}
+        username: ${{ secrets.PROD_USER }}
+        key: ${{ secrets.PROD_SSH_KEY }}
+        script: |
+          cd /opt/gestionmax-production
+          git pull origin main
+          chmod +x scripts/deploy.sh
+          ./scripts/deploy.sh
+
+    - name: Notify deployment
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
